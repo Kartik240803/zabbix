@@ -281,11 +281,8 @@ class ZabbixDB:
                 result = cursor.fetchall()
                 cursor.close()
 
-                if statistical_measure is not None:
-                    if statistical_measure not in ['min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg']:
-                        return []
-                        
-                    return result
+                if result is None:
+                    return []
                 return result
         
             except (MySQLError, PostgresError) as e:
@@ -315,11 +312,8 @@ class ZabbixDB:
             result = cursor.fetchall()
             cursor.close()
 
-            if statistical_measure is not None:
-                if statistical_measure not in ['min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg']:
-                    return []
-                    
-                return result
+            if result is None:
+                return []
             return result
     
         except (MySQLError, PostgresError) as e:
@@ -341,7 +335,6 @@ class ZabbixDB:
             return "get_trends_and_history"
         else:
             return "Invalid range"
-
 
     def get_metric_data(self, hostname: str, metric_name: str, time_from: int, time_to: int, statistical_measure: str = None):
         """
@@ -367,84 +360,61 @@ class ZabbixDB:
         if not history_table:
             return f"No valid history table for item '{metric_name}' with value_type {item_details['value_type']}"
 
-        function_name = self.get_function_name(
-            time_from, time_to,
-            self.convert_day(item_details['history']),
-            self.convert_day(item_details['trends'])
-        )
-
+        if history_table not in ['history_str', 'history_log', 'history_text']:
+            function_name = self.get_function_name(
+                time_from, time_to,
+                self.convert_day(item_details['history']),
+                self.convert_day(item_details['trends'])
+            )
+        else:
+            function_name = "get_history"
         try:
             if statistical_measure:
-                valid_stats = ['min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg']
+                valid_stats = {'min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg'}
                 if statistical_measure not in valid_stats:
                     return self._error_response(
                         f"Invalid statistical measure: {statistical_measure}",
                         hostname, metric_name, item_details['units'], statistical_measure
                     )
 
-                fetch_func = {
-                    "get_history": lambda: self.compute_statistic(self.get_history_data(
-                        itemid=item_details['itemid'],
-                        time_from=time_from,
-                        time_to=time_to,
-                        history_table_name=history_table,
-                        statistical_measure=statistical_measure
-                    ),statistical_measure),
-                    "get_trends": lambda: self.compute_statistic(self.get_trend_data(
-                        itemid=item_details['itemid'],
-                        time_from=time_from,
-                        time_to=time_to,
-                        trend_table_name=trends_table,
-                        statistical_measure=statistical_measure
-                    ),statistical_measure),
-                    "get_trends_and_history": lambda: (
-                        self.compute_statistic((
-                        self.get_history_data(
-                            itemid=item_details['itemid'],
-                            time_from=time_from,
-                            time_to=time_to,
-                            history_table_name=history_table,
-                            statistical_measure=statistical_measure
-                        ) + self.get_trend_data(
-                            itemid=item_details['itemid'],
-                            time_from=time_from,
-                            time_to=time_to,
-                            trend_table_name=trends_table,
-                            statistical_measure=statistical_measure
-                        )),statistical_measure)
-                    )
-                }
+            itemid = item_details['itemid']
 
-            else:
-                fetch_func = {
-                    "get_history": lambda: self.get_history_data(
-                        itemid=item_details['itemid'],
-                        time_from=time_from,
-                        time_to=time_to,
-                        history_table_name=history_table
-                    ),
-                    "get_trends": lambda: self.get_trend_data(
-                        itemid=item_details['itemid'],
-                        time_from=time_from,
-                        time_to=time_to,
-                        trend_table_name=trends_table
-                    ),
-                    "get_trends_and_history": lambda: (
-                        self.get_history_data(
-                            itemid=item_details['itemid'],
-                            time_from=time_from,
-                            time_to=time_to,
-                            history_table_name=history_table
-                        ) + self.get_trend_data(
-                            itemid=item_details['itemid'],
-                            time_from=time_from,
-                            time_to=time_to,
-                            trend_table_name=trends_table
-                        )
-                    )
-                }
+            def fetch_history():
+                return self.get_history_data(itemid, time_from, time_to, history_table)
 
-            data = fetch_func[function_name]()  # ✅ Correct call now
+            def fetch_trends():
+                return self.get_trend_data(itemid, time_from, time_to, trends_table)
+
+            # Fetch function definitions
+            def fetch_history_with_stats():
+                data = fetch_history()
+                return self.compute_statistic(data, statistical_measure) if data else []
+
+            def fetch_trends_with_stats():
+                data = fetch_trends()
+                return self.compute_statistic(data, statistical_measure) if data else []
+
+            def fetch_both_with_stats():
+                history_data = fetch_history()
+                trend_data = fetch_trends()
+                if not history_data and not trend_data:
+                    return []
+                combined = (history_data or []) + (trend_data or [])
+                return self.compute_statistic(combined, statistical_measure)
+
+            def fetch_both_raw():
+                history_data = fetch_history()
+                trend_data = fetch_trends()
+                return (history_data or []) + (trend_data or [])
+
+            fetch_func = {
+                "get_history": fetch_history_with_stats if statistical_measure else lambda: fetch_history() or [],
+                "get_trends": fetch_trends_with_stats if statistical_measure else lambda: fetch_trends() or [],
+                "get_trends_and_history": fetch_both_with_stats if statistical_measure else fetch_both_raw
+            }
+
+            data = fetch_func[function_name]()
+
             return {
                 "status": "success",
                 "hostname": hostname,
@@ -459,7 +429,6 @@ class ZabbixDB:
                 f"Query failed: {str(e)}", hostname, metric_name, item_details['units'], statistical_measure
             )
 
-
     def _error_response(self, message, hostname, metric_name, unit, statistical_measure=None):
         return {
             "status": "error",
@@ -470,7 +439,6 @@ class ZabbixDB:
             "data": [],
             "statistical_measure": statistical_measure
         }
-
         
     def get_host_status(self, hostname: str):
         """
@@ -522,6 +490,7 @@ class ZabbixDB:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit to close connection."""
         self.close()
+
 
 if __name__ == "__main__":
     # Sample database configuration for demonstration
