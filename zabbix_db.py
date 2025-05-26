@@ -1,0 +1,631 @@
+from typing import Optional, Dict, Any
+import mysql.connector
+import psycopg2
+from mysql.connector import Error as MySQLError
+from psycopg2 import Error as PostgresError
+from datetime import datetime, timezone
+import re
+import statistics
+import math
+
+class ZabbixDB:
+    """A class to handle Zabbix database connections and queries for host status."""
+    
+    def __init__(
+        self,
+        db_type: str,
+        host: str,
+        port: int,
+        database: str,
+        user: str,
+        password: str
+    ) -> None:
+        """
+        Initialize the ZabbixDB connection.
+
+        Args:
+            db_type (str): Database type ('mysql' or 'postgresql').
+            host (str): Database host address.
+            port (int): Database port.
+            database (str): Database name.
+            user (str): Database user.
+            password (str): Database password.
+
+        Raises:
+            ValueError: If db_type is not 'mysql' or 'postgresql'.
+        """
+        if db_type not in ['mysql', 'postgresql']:
+            raise ValueError("db_type must be 'mysql' or 'postgresql'")
+        
+        self.db_type = db_type
+        self.host = host
+        self.port = port
+        self.database = database
+        self.user = user
+        self.password = password
+        self.connection = None
+
+    def connect(self) -> None:
+        """Establish a connection to the Zabbix database."""
+        try:
+            if self.db_type == 'mysql':
+                self.connection = mysql.connector.connect(
+                    host=self.host,
+                    port=self.port,
+                    database=self.database,
+                    user=self.user,
+                    password=self.password,
+                    charset='utf8mb4',
+                    use_pure=True
+                )
+            else:  # postgresql
+                self.connection = psycopg2.connect(
+                    host=self.host,
+                    port=self.port,
+                    database=self.database,
+                    user=self.user,
+                    password=self.password
+                )
+        except (MySQLError, PostgresError) as e:
+            raise
+
+    def close(self) -> None:
+        """Close the database connection."""
+        if self.connection and self.connection.is_connected():
+            self.connection.close()
+        self.connection = None
+    
+    def compute_statistic(self, data: list, operation: str):
+        """
+        Computes a statistical measure on a list of dicts with 'clock' and 'value'.
+
+        Args:
+            data (list): List of dicts with keys 'clock' and 'value'.
+            operation (str): One of [
+                'min', 'max', 'mean', 'median', 'stdev', 'sum', 'count',
+                'range', 'mad', 'last'
+            ]
+
+        Returns:
+            - For 'min'/'max': List[dict] with matching clock and value
+            - For 'last': Single dict with latest clock and value
+            - For others: Single float/int result
+        """
+        if not data:
+            raise ValueError("Data list is empty.")
+
+        # operation = operation.lower()
+        values = [item['value'] for item in data]
+
+        if operation == 'min':
+            min_value = min(values)
+            return [item for item in data if item['value'] == min_value]
+
+        elif operation == 'max':
+            max_value = max(values)
+            return [item for item in data if item['value'] == max_value]
+
+        elif operation == 'last':
+            return max(data, key=lambda x: x['clock'])
+
+        elif operation in ('mean', 'avg'):
+            return statistics.mean(values)
+
+        elif operation == 'median':
+            return statistics.median(values)
+
+        elif operation == 'stdev':
+            return statistics.stdev(values)
+
+        elif operation == 'sum':
+            return sum(values)
+
+        elif operation == 'count':
+            return len(values)
+
+        elif operation == 'range':
+            return max(values) - min(values)
+
+        elif operation == 'mad':
+            med = statistics.median(values)
+            return statistics.median([abs(x - med) for x in values])
+
+        else:
+            raise ValueError(f"Unsupported operation: {operation}")
+        
+    def time_difference(self, time_from: int, time_to: int) -> int:
+        """
+        Calculates the difference in days between two Unix timestamps.
+        """
+        dt_from = datetime.fromtimestamp(time_from, tz=timezone.utc)
+        dt_to = datetime.fromtimestamp(time_to, tz=timezone.utc)
+        delta = dt_to - dt_from
+        return delta.days
+    
+    def convert_day(self, duration: str):
+        """
+        Converts a duration string like '1d', '1h', '3d', '1m' to total days.
+        Supports combinations like '1d2h30m'.
+        """
+        # Regex to find all parts (e.g., '1d', '2h', '30m')
+        matches = re.findall(r'(\d+)([dhm])', duration.lower())
+
+        total_days = 0.0
+        for value, unit in matches:
+            value = int(value)
+            if unit == 'd':
+                total_days += value
+            elif unit == 'h':
+                total_days += value / 24
+            elif unit == 'm':
+                total_days += value / (24 * 60)
+
+        return round(total_days, 2)
+    
+    def get_monitoring_Status(self, hostname: str):
+
+        if not self.connection or not self.connection.is_connected():
+            return RuntimeError("Database connection not established")
+
+        host_status_query = """
+        SELECT h.hostid, h.host, h.status
+        FROM hosts h
+        WHERE h.host = %s AND h.flags IN (0, 4)
+        """
+        
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+            cursor.execute(host_status_query, (hostname,))
+            result = cursor.fetchone()
+            cursor.close()
+
+            if result['status'] != 1:
+                return 0 # 0 = enabled, 1 = disabled
+            
+            else:
+                return 1 # 0 = enabled, 1 = disabled
+        
+        except (MySQLError, PostgresError) as e:
+            return RuntimeError(f"Query failed: {str(e)}")
+
+    def get_item_detail(self, hostname: str, item_name: str):
+        """
+        Fetch details of a specific item for a given hostname.
+
+        Args:
+            hostname (str): The hostname to query.
+            item_name (str): The name of the item to query.
+
+        Returns:
+            Optional[Dict[str, Any]]: Dictionary containing item details, history table name,
+                and trends table name, or None if not found.
+
+        Raises:
+            RuntimeError: If database connection is not established or query fails.
+        """
+        if not self.connection or not self.connection.is_connected():
+            raise RuntimeError("No active database connection")
+
+        query = """
+        SELECT i.itemid, i.hostid, i.name, i.history, i.trends, i.value_type, i.status, i.units
+        FROM items i
+        JOIN hosts h ON i.hostid = h.hostid
+        WHERE h.host = %s
+        AND i.name = %s
+        """
+
+        # Mapping of value_type to history and trends table names
+        table_mapping = {
+            0: {'history': 'history', 'trends': 'trends'},
+            1: {'history': 'history_str', 'trends': None},
+            2: {'history': 'history_log', 'trends': None},
+            3: {'history': 'history_uint', 'trends': 'trends_uint'},
+            4: {'history': 'history_text', 'trends': None}
+        }
+
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+            cursor.execute(query, (hostname, item_name))
+            result = cursor.fetchone()
+            cursor.close()
+
+            if not result:
+                return None
+
+            value_type = result['value_type']
+            if value_type not in table_mapping:
+                raise RuntimeError(f"Invalid value_type {value_type} for item {item_name}")
+
+            return {
+                'itemid': result['itemid'],
+                'hostid': result['hostid'],
+                'name': result['name'],
+                'history': result['history'],
+                'trends': result['trends'],
+                'value_type': value_type,
+                'status': result['status'],
+                'units': result['units'],
+                'history_table_name': table_mapping[value_type]['history'],
+                'trends_table_name': table_mapping[value_type]['trends']
+            }
+        except (MySQLError, PostgresError) as e:
+            raise RuntimeError(f"Failed to fetch item details: {str(e)}")
+
+    def get_trend_data(self,itemid: str,time_from: int, time_to: int,trend_table_name: str,statistical_measure: str = None):
+
+            if not self.connection or not self.connection.is_connected():
+                    return "No active database connection"
+
+            # Whitelist valid history tables to prevent SQL injection
+            valid_tables = {'trends', 'trends_uint'}
+            if trend_table_name not in valid_tables:
+                return f"Invalid history table name: {trend_table_name}"
+            
+            # Determine the value column based on the statistical measure
+            if statistical_measure not in ['min','max']:
+                value = 'value_avg'
+            else:
+                value = 'value_max' if statistical_measure == 'max' else 'value_min'
+
+            query = f"""
+            SELECT clock, {value} as value
+            FROM {trend_table_name}
+            WHERE itemid = %s
+            AND clock BETWEEN %s AND %s
+            ORDER BY clock DESC
+            """
+            
+            try:
+                cursor = self.connection.cursor(dictionary=True)
+                cursor.execute(query, (itemid, time_from, time_to))
+                result = cursor.fetchall()
+                cursor.close()
+
+                if statistical_measure is not None:
+                    if statistical_measure not in ['min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg']:
+                        return []
+                        
+                    return self.compute_statistic(result, statistical_measure)
+                return result
+        
+            except (MySQLError, PostgresError) as e:
+                return RuntimeError(f"Query failed: {str(e)}")
+    
+    def get_history_data(self,itemid: str,time_from: int, time_to: int,history_table_name: str,statistical_measure: str = None):
+
+        if not self.connection or not self.connection.is_connected():
+                return "No active database connection"
+
+        # Whitelist valid history tables to prevent SQL injection
+        valid_tables = {'history', 'history_str', 'history_log', 'history_uint', 'history_text'}
+        if history_table_name not in valid_tables:
+            return f"Invalid history table name: {history_table_name}"
+
+        query = f"""
+        SELECT clock, value
+        FROM {history_table_name}
+        WHERE itemid = %s
+        AND clock BETWEEN %s AND %s
+        ORDER BY clock DESC
+        """
+
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+            cursor.execute(query, (itemid, time_from, time_to))
+            result = cursor.fetchall()
+            cursor.close()
+
+            if statistical_measure is not None:
+                if statistical_measure not in ['min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg']:
+                    return []
+                    
+                return self.compute_statistic(result, statistical_measure)
+            return result
+    
+        except (MySQLError, PostgresError) as e:
+            return RuntimeError(f"Query failed: {str(e)}")
+
+    def get_function_name(self,time_from: int, time_to: int,history_days, trends_days):
+        current_time = float(datetime.now().timestamp())
+        seconds_in_day = float(86400)
+        history_threshold = int(current_time - (history_days * seconds_in_day))
+        trends_threshold = int(current_time - (trends_days * seconds_in_day))
+
+        if time_to < trends_threshold:
+            return "No data - too old"
+        elif time_from >= history_threshold:
+            return "get_history"
+        elif time_to <= history_threshold and time_from >= trends_threshold:
+            return "get_trends"
+        elif time_from < history_threshold and time_to >= history_threshold:
+            return "get_trends_and_history"
+        else:
+            return "Invalid range"
+
+
+    def get_metric_data(self, hostname: str, metric_name: str, time_from: int, time_to: int,statistical_measure: str = None):
+        """
+        Fetch historical data for a specific metric (item) of a host within a time range.
+
+        Args:
+            hostname (str): The hostname to query.
+            metric_name (str): The name of the metric (item) to query.
+            time_from (int): Start of the time range (Unix timestamp).
+            time_to (int): End of the time range (Unix timestamp).
+
+        Returns:
+            Union[List[Dict[str, Any]], str]: List of dictionaries with 'clock' and 'value' for the metric,
+                or a string message if the host/item is disabled, not found, or an error occurs (e.g., no connection,
+                invalid time range, query failure).
+        """
+
+        if time_from > time_to:
+            return "Invalid time range: time_from must be less than or equal to time_to"
+
+        monitoring_status = self.get_monitoring_Status(hostname)
+        item_details = self.get_item_detail(hostname, metric_name)
+
+        history= self.convert_day(item_details['history'])
+        trends= self.convert_day(item_details['trends'])
+
+        function_name = self.get_function_name(time_from, time_to, history, trends)
+
+        
+
+
+        if item_details is None:
+            return f"Item '{metric_name}' not found for host '{hostname}'"
+
+        history_table_name = item_details['history_table_name']
+        trends_table_name = item_details['trends_table_name']
+        if not history_table_name:
+            return f"No valid history table for item '{metric_name}' with value_type {item_details['value_type']}"
+
+        if monitoring_status == 0 and item_details['status'] == 0:
+
+            try:
+                if (statistical_measure is not None) and (history_table_name in ['history', 'history_uint','trends_uint','trends'] or statistical_measure == 'last'):
+                    if statistical_measure not in ['min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg']:
+                        return {
+                            "status": "error",
+                            "message": f"Invalid statistical measure: {statistical_measure}",
+                            "hostname": hostname,
+                            "metric_name": metric_name,
+                            "unit": item_details['units'],
+                            "data": [],
+                            "statistical_measure": statistical_measure
+                        }
+                    else:
+                        if function_name == "get_history":
+                            result = self.get_history_data(
+                                itemid=item_details['itemid'],
+                                time_from=time_from,
+                                time_to=time_to,
+                                history_table_name=history_table_name,
+                                statistical_measure=statistical_measure
+                            )
+                            return {
+                                "status": "success",
+                                "hostname": hostname,
+                                "metric_name": metric_name,
+                                "unit": item_details['units'],
+                                "data": result,
+                                "statistical_measure": statistical_measure
+                            }
+                            
+                        elif function_name == "get_trends":
+                            result = self.get_trend_data(
+                                itemid=item_details['itemid'],
+                                time_from=time_from,
+                                time_to=time_to,
+                                trend_table_name=trends_table_name,
+                                statistical_measure=statistical_measure
+                            )
+
+                            return {
+                                "status": "success",
+                                "hostname": hostname,
+                                "metric_name": metric_name,
+                                "unit": item_details['units'],
+                                "data": result,
+                                "statistical_measure": statistical_measure
+                            }
+                        elif function_name == "get_trends_and_history":
+                            history_result = self.get_history_data(
+                                itemid=item_details['itemid'],
+                                time_from=time_from,
+                                time_to=time_to,
+                                history_table_name=history_table_name,
+                                statistical_measure=statistical_measure
+                            )
+                            trend_result = self.get_trend_data(
+                                itemid=item_details['itemid'],
+                                time_from=time_from,
+                                time_to=time_to,
+                                trend_table_name=trends_table_name,
+                                statistical_measure=statistical_measure
+                            )
+                            result = history_result + trend_result
+                            return {
+                                "status": "success",
+                                "hostname": hostname,
+                                "metric_name": metric_name,
+                                "unit": item_details['units'],
+                                "data": result,
+                                "statistical_measure": statistical_measure
+                            }
+                else:
+                    if function_name == "get_history":
+                        result = self.get_history_data(
+                            itemid=item_details['itemid'],
+                            time_from=time_from,
+                            time_to=time_to,
+                            history_table_name=history_table_name
+                        )
+                        return {
+                            "status": "success",
+                            "hostname": hostname,
+                            "metric_name": metric_name,
+                            "unit": item_details['units'],
+                            "data": result,
+                            "statistical_measure": statistical_measure
+                        }
+                        
+                    elif function_name == "get_trends":
+                        result = self.get_trend_data(
+                            itemid=item_details['itemid'],
+                            time_from=time_from,
+                            time_to=time_to,
+                            trend_table_name=trends_table_name
+                        )
+
+                        return {
+                            "status": "success",
+                            "hostname": hostname,
+                            "metric_name": metric_name,
+                            "unit": item_details['units'],
+                            "data": result,
+                            "statistical_measure": statistical_measure
+                        }
+                    elif function_name == "get_trends_and_history":
+                        history_result = self.get_history_data(
+                            itemid=item_details['itemid'],
+                            time_from=time_from,
+                            time_to=time_to,
+                            history_table_name=history_table_name
+                        )
+                        trend_result = self.get_trend_data(
+                            itemid=item_details['itemid'],
+                            time_from=time_from,
+                            time_to=time_to,
+                            trend_table_name=trends_table_name
+                        )
+                        result = history_result + trend_result
+                        return {
+                            "status": "success",
+                            "hostname": hostname,
+                            "metric_name": metric_name,
+                            "unit": item_details['units'],
+                            "data": result,
+                            "statistical_measure": statistical_measure
+                        }
+
+
+            except (MySQLError, PostgresError) as e:
+                return {
+                    "status": "error",
+                    "message": f"Query failed: {str(e)}",
+                    "hostname": hostname,
+                    "metric_name": metric_name,
+                    "unit": item_details['units'],
+                    "data": [],
+                }
+        else:
+            if monitoring_status == 1:
+                return {
+                    "status": "error",
+                    "message": f"Host '{hostname}' is disabled",
+                    "hostname": hostname,
+                    "metric_name": metric_name,
+                    "unit": item_details['units'],
+                    "data": []
+                }
+            return {
+                    "status": "error",
+                    "message": f"Item '{metric_name}' is disabled",
+                    "hostname": hostname,
+                    "metric_name": metric_name,
+                    "unit": item_details['units'],
+                    "data": []
+                }
+        
+    def get_host_status(self, hostname: str):
+        """
+        Fetch the status of a host by its hostname.
+
+        Args:
+            hostname (str): The hostname to query.
+
+        Returns:
+            Optional[Dict[str, Any]]: Dictionary containing host status details or None if not found.
+
+        Raises:
+            RuntimeError: If database connection is not established or query fails.
+        """
+        if not self.connection or not self.connection.is_connected():
+            return RuntimeError("Database connection not established")
+
+        host_status_query = """
+        SELECT h.hostid, h.host, h.status
+        FROM hosts h
+        WHERE h.host = %s AND h.flags IN (0, 4)
+        """
+        
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+            cursor.execute(host_status_query, (hostname,))
+            result = cursor.fetchone()
+            cursor.close()
+
+            if result['status'] != 1:
+                return {
+                    'hostid': result['hostid'],
+                    'hostname': result['host'],
+                    'status': result['status']  # 0 = enabled, 1 = disabled
+                }
+            
+            else:
+                message = f"Host '{hostname}' is disabled."
+                return message
+        
+        except (MySQLError, PostgresError) as e:
+            return RuntimeError(f"Query failed: {str(e)}")
+
+    def __enter__(self):
+        """Context manager entry to establish connection."""
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit to close connection."""
+        self.close()
+
+if __name__ == "__main__":
+    # Sample database configuration for demonstration
+    db_config = {
+        'db_type': 'mysql',  # or 'postgresql'
+        'host': '140.238.230.93',
+        'port': 3306,  # 5432 for PostgreSQL
+        'database': 'zabbix',
+        'user': 'kartik',
+        'password': 'Kartik@24082003'
+    }
+
+    # Sample hostname to query
+    hostname = 'Zabbix server'
+    metric_name = 'FS [/]: Inodes: Free, in %'
+
+    try:
+        with ZabbixDB(**db_config) as zbx:
+            result = zbx.get_metric_data(
+                hostname=hostname,
+                metric_name=metric_name,
+                time_from=1747751299,  # Example start time (Unix timestamp)
+                time_to=1747837706,  # Example end time (Unix timestamp)
+                statistical_measure='min'  # Example statistical measure
+            )
+            print(result)
+
+            # print(zbx.time_difference(1747751299, 1747837706))
+            # print(zbx.convert_day('1h'))
+
+            # print(zbx.compute_statistic(result['data'], 'mean'))
+            # print(zbx.compute_statistic(result['data'], 'median'))
+            # print(zbx.compute_statistic(result['data'], 'min'))
+            # print(zbx.compute_statistic(result['data'], 'max'))
+            # print(zbx.compute_statistic(result['data'], 'stdev'))
+            # print(zbx.compute_statistic(result['data'], 'sum'))
+            # print(zbx.compute_statistic(result['data'], 'count'))
+
+    except (RuntimeError, ValueError) as e:
+        print(f"Error: {str(e)}")
