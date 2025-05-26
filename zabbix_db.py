@@ -285,7 +285,7 @@ class ZabbixDB:
                     if statistical_measure not in ['min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg']:
                         return []
                         
-                    return self.compute_statistic(result, statistical_measure)
+                    return result
                 return result
         
             except (MySQLError, PostgresError) as e:
@@ -319,7 +319,7 @@ class ZabbixDB:
                 if statistical_measure not in ['min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg']:
                     return []
                     
-                return self.compute_statistic(result, statistical_measure)
+                return result
             return result
     
         except (MySQLError, PostgresError) as e:
@@ -343,201 +343,134 @@ class ZabbixDB:
             return "Invalid range"
 
 
-    def get_metric_data(self, hostname: str, metric_name: str, time_from: int, time_to: int,statistical_measure: str = None):
+    def get_metric_data(self, hostname: str, metric_name: str, time_from: int, time_to: int, statistical_measure: str = None):
         """
         Fetch historical data for a specific metric (item) of a host within a time range.
-
-        Args:
-            hostname (str): The hostname to query.
-            metric_name (str): The name of the metric (item) to query.
-            time_from (int): Start of the time range (Unix timestamp).
-            time_to (int): End of the time range (Unix timestamp).
-
-        Returns:
-            Union[List[Dict[str, Any]], str]: List of dictionaries with 'clock' and 'value' for the metric,
-                or a string message if the host/item is disabled, not found, or an error occurs (e.g., no connection,
-                invalid time range, query failure).
         """
-
         if time_from > time_to:
             return "Invalid time range: time_from must be less than or equal to time_to"
 
         monitoring_status = self.get_monitoring_Status(hostname)
         item_details = self.get_item_detail(hostname, metric_name)
 
-        history= self.convert_day(item_details['history'])
-        trends= self.convert_day(item_details['trends'])
-
-        function_name = self.get_function_name(time_from, time_to, history, trends)
-
-        
-
-
         if item_details is None:
             return f"Item '{metric_name}' not found for host '{hostname}'"
 
-        history_table_name = item_details['history_table_name']
-        trends_table_name = item_details['trends_table_name']
-        if not history_table_name:
+        if monitoring_status == 1:
+            return self._error_response(f"Host '{hostname}' is disabled", hostname, metric_name, "unknown")
+
+        if item_details['status'] != 0:
+            return self._error_response(f"Item '{metric_name}' is disabled", hostname, metric_name, item_details['units'])
+
+        history_table = item_details.get('history_table_name')
+        trends_table = item_details.get('trends_table_name')
+        if not history_table:
             return f"No valid history table for item '{metric_name}' with value_type {item_details['value_type']}"
 
-        if monitoring_status == 0 and item_details['status'] == 0:
+        function_name = self.get_function_name(
+            time_from, time_to,
+            self.convert_day(item_details['history']),
+            self.convert_day(item_details['trends'])
+        )
 
-            try:
-                if (statistical_measure is not None) and (history_table_name in ['history', 'history_uint','trends_uint','trends'] or statistical_measure == 'last'):
-                    if statistical_measure not in ['min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg']:
-                        return {
-                            "status": "error",
-                            "message": f"Invalid statistical measure: {statistical_measure}",
-                            "hostname": hostname,
-                            "metric_name": metric_name,
-                            "unit": item_details['units'],
-                            "data": [],
-                            "statistical_measure": statistical_measure
-                        }
-                    else:
-                        if function_name == "get_history":
-                            result = self.get_history_data(
-                                itemid=item_details['itemid'],
-                                time_from=time_from,
-                                time_to=time_to,
-                                history_table_name=history_table_name,
-                                statistical_measure=statistical_measure
-                            )
-                            return {
-                                "status": "success",
-                                "hostname": hostname,
-                                "metric_name": metric_name,
-                                "unit": item_details['units'],
-                                "data": result,
-                                "statistical_measure": statistical_measure
-                            }
-                            
-                        elif function_name == "get_trends":
-                            result = self.get_trend_data(
-                                itemid=item_details['itemid'],
-                                time_from=time_from,
-                                time_to=time_to,
-                                trend_table_name=trends_table_name,
-                                statistical_measure=statistical_measure
-                            )
+        try:
+            if statistical_measure:
+                valid_stats = ['min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg']
+                if statistical_measure not in valid_stats:
+                    return self._error_response(
+                        f"Invalid statistical measure: {statistical_measure}",
+                        hostname, metric_name, item_details['units'], statistical_measure
+                    )
 
-                            return {
-                                "status": "success",
-                                "hostname": hostname,
-                                "metric_name": metric_name,
-                                "unit": item_details['units'],
-                                "data": result,
-                                "statistical_measure": statistical_measure
-                            }
-                        elif function_name == "get_trends_and_history":
-                            history_result = self.get_history_data(
-                                itemid=item_details['itemid'],
-                                time_from=time_from,
-                                time_to=time_to,
-                                history_table_name=history_table_name,
-                                statistical_measure=statistical_measure
-                            )
-                            trend_result = self.get_trend_data(
-                                itemid=item_details['itemid'],
-                                time_from=time_from,
-                                time_to=time_to,
-                                trend_table_name=trends_table_name,
-                                statistical_measure=statistical_measure
-                            )
-                            result = history_result + trend_result
-                            return {
-                                "status": "success",
-                                "hostname": hostname,
-                                "metric_name": metric_name,
-                                "unit": item_details['units'],
-                                "data": result,
-                                "statistical_measure": statistical_measure
-                            }
-                else:
-                    if function_name == "get_history":
-                        result = self.get_history_data(
+                fetch_func = {
+                    "get_history": lambda: self.compute_statistic(self.get_history_data(
+                        itemid=item_details['itemid'],
+                        time_from=time_from,
+                        time_to=time_to,
+                        history_table_name=history_table,
+                        statistical_measure=statistical_measure
+                    ),statistical_measure),
+                    "get_trends": lambda: self.compute_statistic(self.get_trend_data(
+                        itemid=item_details['itemid'],
+                        time_from=time_from,
+                        time_to=time_to,
+                        trend_table_name=trends_table,
+                        statistical_measure=statistical_measure
+                    ),statistical_measure),
+                    "get_trends_and_history": lambda: (
+                        self.compute_statistic((
+                        self.get_history_data(
                             itemid=item_details['itemid'],
                             time_from=time_from,
                             time_to=time_to,
-                            history_table_name=history_table_name
-                        )
-                        return {
-                            "status": "success",
-                            "hostname": hostname,
-                            "metric_name": metric_name,
-                            "unit": item_details['units'],
-                            "data": result,
-                            "statistical_measure": statistical_measure
-                        }
-                        
-                    elif function_name == "get_trends":
-                        result = self.get_trend_data(
+                            history_table_name=history_table,
+                            statistical_measure=statistical_measure
+                        ) + self.get_trend_data(
                             itemid=item_details['itemid'],
                             time_from=time_from,
                             time_to=time_to,
-                            trend_table_name=trends_table_name
-                        )
-
-                        return {
-                            "status": "success",
-                            "hostname": hostname,
-                            "metric_name": metric_name,
-                            "unit": item_details['units'],
-                            "data": result,
-                            "statistical_measure": statistical_measure
-                        }
-                    elif function_name == "get_trends_and_history":
-                        history_result = self.get_history_data(
-                            itemid=item_details['itemid'],
-                            time_from=time_from,
-                            time_to=time_to,
-                            history_table_name=history_table_name
-                        )
-                        trend_result = self.get_trend_data(
-                            itemid=item_details['itemid'],
-                            time_from=time_from,
-                            time_to=time_to,
-                            trend_table_name=trends_table_name
-                        )
-                        result = history_result + trend_result
-                        return {
-                            "status": "success",
-                            "hostname": hostname,
-                            "metric_name": metric_name,
-                            "unit": item_details['units'],
-                            "data": result,
-                            "statistical_measure": statistical_measure
-                        }
-
-
-            except (MySQLError, PostgresError) as e:
-                return {
-                    "status": "error",
-                    "message": f"Query failed: {str(e)}",
-                    "hostname": hostname,
-                    "metric_name": metric_name,
-                    "unit": item_details['units'],
-                    "data": [],
+                            trend_table_name=trends_table,
+                            statistical_measure=statistical_measure
+                        )),statistical_measure)
+                    )
                 }
-        else:
-            if monitoring_status == 1:
-                return {
-                    "status": "error",
-                    "message": f"Host '{hostname}' is disabled",
-                    "hostname": hostname,
-                    "metric_name": metric_name,
-                    "unit": item_details['units'],
-                    "data": []
+
+            else:
+                fetch_func = {
+                    "get_history": lambda: self.get_history_data(
+                        itemid=item_details['itemid'],
+                        time_from=time_from,
+                        time_to=time_to,
+                        history_table_name=history_table
+                    ),
+                    "get_trends": lambda: self.get_trend_data(
+                        itemid=item_details['itemid'],
+                        time_from=time_from,
+                        time_to=time_to,
+                        trend_table_name=trends_table
+                    ),
+                    "get_trends_and_history": lambda: (
+                        self.get_history_data(
+                            itemid=item_details['itemid'],
+                            time_from=time_from,
+                            time_to=time_to,
+                            history_table_name=history_table
+                        ) + self.get_trend_data(
+                            itemid=item_details['itemid'],
+                            time_from=time_from,
+                            time_to=time_to,
+                            trend_table_name=trends_table
+                        )
+                    )
                 }
+
+            data = fetch_func[function_name]()  # ✅ Correct call now
             return {
-                    "status": "error",
-                    "message": f"Item '{metric_name}' is disabled",
-                    "hostname": hostname,
-                    "metric_name": metric_name,
-                    "unit": item_details['units'],
-                    "data": []
-                }
+                "status": "success",
+                "hostname": hostname,
+                "metric_name": metric_name,
+                "unit": item_details['units'],
+                "data": data,
+                "statistical_measure": statistical_measure
+            }
+
+        except (MySQLError, PostgresError) as e:
+            return self._error_response(
+                f"Query failed: {str(e)}", hostname, metric_name, item_details['units'], statistical_measure
+            )
+
+
+    def _error_response(self, message, hostname, metric_name, unit, statistical_measure=None):
+        return {
+            "status": "error",
+            "message": message,
+            "hostname": hostname,
+            "metric_name": metric_name,
+            "unit": unit,
+            "data": [],
+            "statistical_measure": statistical_measure
+        }
+
         
     def get_host_status(self, hostname: str):
         """
@@ -603,16 +536,16 @@ if __name__ == "__main__":
 
     # Sample hostname to query
     hostname = 'Zabbix server'
-    metric_name = 'FS [/]: Inodes: Free, in %'
+    metric_name = 'Zabbix agent availability'
 
     try:
         with ZabbixDB(**db_config) as zbx:
             result = zbx.get_metric_data(
                 hostname=hostname,
                 metric_name=metric_name,
-                time_from=1747751299,  # Example start time (Unix timestamp)
-                time_to=1747837706,  # Example end time (Unix timestamp)
-                statistical_measure='min'  # Example statistical measure
+                time_from=1748255366,  # Example start time (Unix timestamp)
+                time_to=1748257551,  # Example end time (Unix timestamp)
+                statistical_measure='last'  # Example statistical measure
             )
             print(result)
 
