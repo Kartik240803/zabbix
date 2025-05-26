@@ -357,6 +357,7 @@ class ZabbixDB:
 
         history_table = item_details.get('history_table_name')
         trends_table = item_details.get('trends_table_name')
+        
         if not history_table:
             return f"No valid history table for item '{metric_name}' with value_type {item_details['value_type']}"
 
@@ -368,6 +369,8 @@ class ZabbixDB:
             )
         else:
             function_name = "get_history"
+            statistical_measure = statistical_measure if statistical_measure == 'last' else None # No statistics for string/log/text history
+
         try:
             if statistical_measure:
                 valid_stats = {'min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg'}
@@ -380,10 +383,10 @@ class ZabbixDB:
             itemid = item_details['itemid']
 
             def fetch_history():
-                return self.get_history_data(itemid, time_from, time_to, history_table)
+                return self.get_history_data(itemid, time_from, time_to, history_table, statistical_measure)
 
             def fetch_trends():
-                return self.get_trend_data(itemid, time_from, time_to, trends_table)
+                return self.get_trend_data(itemid, time_from, time_to, trends_table, statistical_measure)
 
             # Fetch function definitions
             def fetch_history_with_stats():
@@ -505,14 +508,15 @@ if __name__ == "__main__":
 
     # Sample hostname to query
     hostname = 'Zabbix server'
-    metric_name = 'Zabbix agent availability'
+    # metric_name = 'Zabbix agent availability'
+    metric_name = 'Host name of Zabbix agent running'
 
     try:
         with ZabbixDB(**db_config) as zbx:
             result = zbx.get_metric_data(
                 hostname=hostname,
                 metric_name=metric_name,
-                time_from=1748255366,  # Example start time (Unix timestamp)
+                time_from=1716719399,  # Example start time (Unix timestamp)
                 time_to=1748257551,  # Example end time (Unix timestamp)
                 statistical_measure='last'  # Example statistical measure
             )
