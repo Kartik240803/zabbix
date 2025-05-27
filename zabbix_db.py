@@ -432,6 +432,41 @@ class ZabbixDB:
                 f"Query failed: {str(e)}", hostname, metric_name, item_details['units'], statistical_measure
             )
 
+    def get_alerts(self,hostname: str = None, time_from: int = None, time_to: int = None,limit: int = 100,host_group: str = None):
+
+        query = '''
+                SELECT DISTINCT
+            p.eventid,
+            p.objectid AS triggerid,
+            p.clock,
+            p.name,
+            p.acknowledged,
+            p.severity,
+            h.host,
+            COALESCE(p2.clock, UNIX_TIMESTAMP()) - p.clock AS duration_seconds
+        FROM 
+            problem p
+        LEFT JOIN 
+            problem p2 ON p2.eventid = p.r_eventid
+        JOIN 
+            functions f ON p.objectid = f.triggerid
+        JOIN 
+            items i ON f.itemid = i.itemid
+        JOIN 
+            hosts h ON i.hostid = h.hostid
+        JOIN 
+            triggers t ON p.objectid = t.triggerid
+        WHERE 
+            p.r_eventid IS NULL
+            AND h.status = 0
+            AND h.flags IN (0, 4)
+            AND t.status = 0
+            AND i.status = 0
+        ORDER BY p.eventid ASC
+        LIMIT 100;
+    '''
+        pass
+
     def _error_response(self, message, hostname, metric_name, unit, statistical_measure=None):
         return {
             "status": "error",
