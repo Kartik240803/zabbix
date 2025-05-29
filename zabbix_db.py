@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import re
 import statistics
 import math
+import pandas as pd
 
 class ZabbixDB:
     """A class to handle Zabbix database connections and queries for host status."""
@@ -432,40 +433,48 @@ class ZabbixDB:
                 f"Query failed: {str(e)}", hostname, metric_name, item_details['units'], statistical_measure
             )
 
-    def get_alerts(self,hostname: str = None, time_from: int = None, time_to: int = None,limit: int = 100,host_group: str = None):
+    def get_all_alerts(self):
+        if not self.connection or not self.connection.is_connected():
+            return "No active database connection"
 
         query = '''
-                SELECT DISTINCT
-            p.eventid,
-            p.objectid AS triggerid,
-            p.clock,
-            p.name,
-            p.acknowledged,
-            p.severity,
-            h.host,
-            COALESCE(p2.clock, UNIX_TIMESTAMP()) - p.clock AS duration_seconds
-        FROM 
-            problem p
-        LEFT JOIN 
-            problem p2 ON p2.eventid = p.r_eventid
-        JOIN 
-            functions f ON p.objectid = f.triggerid
-        JOIN 
-            items i ON f.itemid = i.itemid
-        JOIN 
-            hosts h ON i.hostid = h.hostid
-        JOIN 
-            triggers t ON p.objectid = t.triggerid
-        WHERE 
-            p.r_eventid IS NULL
-            AND h.status = 0
-            AND h.flags IN (0, 4)
-            AND t.status = 0
-            AND i.status = 0
-        ORDER BY p.eventid ASC
-        LIMIT 100;
-    '''
-        pass
+            SELECT DISTINCT
+                h.name AS host,
+                t.description AS trigger_name,
+                e.name AS event_name,
+                e.eventid,
+                e.acknowledged,
+                e.clock AS start_time,
+                COALESCE(er.clock, UNIX_TIMESTAMP()) AS end_time,
+                COALESCE(er.clock, UNIX_TIMESTAMP()) - e.clock AS duration,
+                er.eventid AS recovery_eventid
+            FROM hosts h
+            JOIN items i ON i.hostid = h.hostid AND i.status = 0
+            JOIN functions f ON f.itemid = i.itemid
+            JOIN triggers t ON t.triggerid = f.triggerid AND t.status = 0
+            JOIN events e ON e.objectid = t.triggerid AND e.object = 0 AND e.value = 1
+            LEFT JOIN event_recovery erc ON erc.eventid = e.eventid
+            LEFT JOIN events er ON er.eventid = erc.r_eventid
+            WHERE 
+                h.status = 0
+                AND h.flags IN (0, 4)
+        '''
+
+        try:
+            with self.connection.cursor(dictionary=True) as cursor:
+                cursor.execute(query)
+                result = cursor.fetchall()
+
+            return result if result else "No alerts history found"
+
+        except (MySQLError, PostgresError) as e:
+            return f"Query failed: {str(e)}"
+
+    def get_alerts(self,hostname: str = None, time_from: int = None, time_to: int = None,limit: int = 100,host_group: str = None):
+        
+        alerts = self.get_all_alerts()
+        alerts = pd.DataFrame(alerts)
+        
 
     def _error_response(self, message, hostname, metric_name, unit, statistical_measure=None):
         return {
