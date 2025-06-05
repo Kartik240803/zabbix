@@ -189,6 +189,35 @@ class ZabbixDB:
         except (MySQLError, PostgresError) as e:
             return RuntimeError(f"Query failed: {str(e)}")
 
+    def get_host_by_group(host_group):
+        """
+        Function to get the host group for a given host.
+        This is a placeholder function; implement the actual logic as needed.
+        """
+        query = """
+        SELECT 
+    g.name AS group_name,
+    h.host AS host_name
+    FROM hstgrp g
+    JOIN hosts_groups hg ON g.groupid = hg.groupid
+    JOIN hosts h ON hg.hostid = h.hostid
+    WHERE g.name = %s
+    """
+        try:
+            connection = pymysql.connect(**db_config)
+            with connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(query, (host_group,))
+                    result = cursor.fetchall()
+                    if result:
+                        return result
+        
+        except Exception as e:
+            print("Error retrieving host group:", e)
+
+        # Example logic, replace with actual implementation
+        return "Default Group"  # Replace with actual group retrieval logic
+
     def get_item_detail(self, hostname: str, item_name: str):
         """
         Fetch details of a specific item for a given hostname.
@@ -470,11 +499,50 @@ class ZabbixDB:
         except (MySQLError, PostgresError) as e:
             return f"Query failed: {str(e)}"
 
-    def get_alerts(self,hostname: str = None, time_from: int = None, time_to: int = None,limit: int = 100,host_group: str = None):
+    def get_alerts(self,time_from: int = None, time_to: int = None, hostname: str = None, limit: int = None, host_group: str = None):
+        alerts = pd.DataFrame(self.get_all_alerts())
+        alerts = alerts.sort_values(by='start_time', ascending=False)
         
-        alerts = self.get_all_alerts()
-        alerts = pd.DataFrame(alerts)
-        
+        if time_from is not None:
+            alerts = alerts[alerts['start_time'] >= time_from]
+        if time_to is not None:
+            alerts = alerts[alerts['start_time'] <= time_to]
+        if hostname is not None:
+            alerts = alerts[alerts['host'] == hostname]
+        if host_group is not None:
+            host_list = self.get_host_by_group(host_group)
+            host_in_group = [h['host_name'] for h in host_list]
+            alerts = alerts[alerts['host'].isin(host_in_group)]
+
+        if limit is not None:
+            alerts = alerts.head(limit)
+
+        return alerts
+
+    def get_common_issues(self, time_from: int = None, time_to: int = None, hostname: str = None, limit: int = 10, host_group: str = None):
+        alerts=self.get_alerts(time_from, time_to, hostname,host_group)
+
+        common_issues = alerts.groupby('event_name').agg(
+            total_count=('eventid', 'count'),
+            acknowledged_count=('acknowledged', lambda x: (x == 1).sum()),
+            unacknowledged_count=('acknowledged', lambda x: (x == 0).sum())
+        ).reset_index().sort_values(by='total_count', ascending=False)
+
+        common_issues = common_issues.head(limit)
+
+        if common_issues.empty:
+            return {
+                "status": "error",
+                "message": "No common issues found",
+                "data": []
+            }
+        return {
+            "status": "success",
+            "message": "Common issues retrieved successfully",
+            "data": common_issues.to_dict(orient='records')
+        }
+
+
 
     def _error_response(self, message, hostname, metric_name, unit, statistical_measure=None):
         return {
@@ -557,13 +625,16 @@ if __name__ == "__main__":
 
     try:
         with ZabbixDB(**db_config) as zbx:
-            result = zbx.get_metric_data(
-                hostname=hostname,
-                metric_name=metric_name,
-                time_from=1716719399,  # Example start time (Unix timestamp)
-                time_to=1748257551,  # Example end time (Unix timestamp)
-                statistical_measure='last'  # Example statistical measure
-            )
+            # result = zbx.get_metric_data(
+            #     hostname=hostname,
+            #     metric_name=metric_name,
+            #     time_from=1716719399,  # Example start time (Unix timestamp)
+            #     time_to=1748257551,  # Example end time (Unix timestamp)
+            #     statistical_measure='last'  # Example statistical measure
+            # )
+            # print(result)
+
+            result = zbx.get_alerts()
             print(result)
 
             # print(zbx.time_difference(1747751299, 1747837706))
