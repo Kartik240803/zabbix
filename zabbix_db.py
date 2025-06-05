@@ -189,46 +189,55 @@ class ZabbixDB:
         except (MySQLError, PostgresError) as e:
             return RuntimeError(f"Query failed: {str(e)}")
 
-    def get_host_by_group(host_group):
+    def get_host_by_group(self,host_group):
         """
         Function to get the host group for a given host.
         This is a placeholder function; implement the actual logic as needed.
         """
         query = """
         SELECT 
-    g.name AS group_name,
-    h.host AS host_name
-    FROM hstgrp g
-    JOIN hosts_groups hg ON g.groupid = hg.groupid
-    JOIN hosts h ON hg.hostid = h.hostid
-    WHERE g.name = %s
-    """
-        try:
-            connection = pymysql.connect(**db_config)
-            with connection:
-                with connection.cursor() as cursor:
-                    cursor.execute(query, (host_group,))
-                    result = cursor.fetchall()
-                    if result:
-                        return result
-        
-        except Exception as e:
-            print("Error retrieving host group:", e)
-
-        # Example logic, replace with actual implementation
-        return "Default Group"  # Replace with actual group retrieval logic
-
-    def get_item_detail(self, hostname: str, item_name: str):
+        g.name AS group_name,
+        h.host AS host_name
+        FROM hstgrp g
+        JOIN hosts_groups hg ON g.groupid = hg.groupid
+        JOIN hosts h ON hg.hostid = h.hostid
+        WHERE g.name = %s
         """
-        Fetch details of a specific item for a given hostname.
+        
+        query_all_groups = """
+        SELECT
+        h.host AS host_name
+        FROM hosts h
+        WHERE h.status = 0 AND h.flags IN (0, 4)
+        """
+
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+            if host_group.lower() == 'all':
+                cursor.execute(query_all_groups)
+            else:
+                cursor.execute(query, (host_group,))
+            result = cursor.fetchall()
+            cursor.close()
+
+            if result is None:
+                return []
+            return result
+    
+        except (MySQLError, PostgresError) as e:
+            return RuntimeError(f"Query failed: {str(e)}")
+        
+    def get_item_detail(self, item_name: str, hostname: str = None):
+        """
+        Fetch details of a specific item. Returns one item if hostname is provided,
+        otherwise returns all matching items across hosts.
 
         Args:
-            hostname (str): The hostname to query.
             item_name (str): The name of the item to query.
+            hostname (str, optional): The hostname to query.
 
         Returns:
-            Optional[Dict[str, Any]]: Dictionary containing item details, history table name,
-                and trends table name, or None if not found.
+            Union[Dict[str, Any], List[Dict[str, Any]], None]: Item detail(s) or None if not found.
 
         Raises:
             RuntimeError: If database connection is not established or query fails.
@@ -236,15 +245,23 @@ class ZabbixDB:
         if not self.connection or not self.connection.is_connected():
             raise RuntimeError("No active database connection")
 
-        query = """
-        SELECT i.itemid, i.hostid, i.name, i.history, i.trends, i.value_type, i.status, i.units
+        query_with_host = """
+        SELECT i.itemid, i.hostid, i.name, i.history, i.trends, i.value_type,
+            i.status, i.units, h.host
         FROM items i
         JOIN hosts h ON i.hostid = h.hostid
-        WHERE h.host = %s
-        AND i.name = %s
+        WHERE h.host = %s AND i.name = %s
         """
 
-        # Mapping of value_type to history and trends table names
+        query_without_host = """
+        SELECT i.itemid, i.hostid, i.name, i.history, i.trends, i.value_type,
+            i.status, i.units, h.host
+        FROM items i
+        JOIN hosts h ON i.hostid = h.hostid
+        WHERE i.name = %s
+        AND h.status = 0 AND h.flags IN (0, 4)
+        """
+
         table_mapping = {
             0: {'history': 'history', 'trends': 'trends'},
             1: {'history': 'history_str', 'trends': None},
@@ -255,29 +272,40 @@ class ZabbixDB:
 
         try:
             cursor = self.connection.cursor(dictionary=True)
-            cursor.execute(query, (hostname, item_name))
-            result = cursor.fetchone()
+            if hostname:
+                cursor.execute(query_with_host, (hostname, item_name))
+            else:
+                cursor.execute(query_without_host, (item_name,))
+            
+            results = cursor.fetchall()
             cursor.close()
 
-            if not result:
+            if not results:
                 return None
 
-            value_type = result['value_type']
-            if value_type not in table_mapping:
-                raise RuntimeError(f"Invalid value_type {value_type} for item {item_name}")
+            def map_item(item):
+                value_type = item['value_type']
+                if value_type not in table_mapping:
+                    raise RuntimeError(f"Invalid value_type {value_type} for item {item['name']}")
+                return {
+                    'hostname': item['host'],
+                    'itemid': item['itemid'],
+                    'hostid': item['hostid'],
+                    'name': item['name'],
+                    'history': item['history'],
+                    'trends': item['trends'],
+                    'value_type': value_type,
+                    'status': item['status'],
+                    'units': item['units'],
+                    'history_table_name': table_mapping[value_type]['history'],
+                    'trends_table_name': table_mapping[value_type]['trends']
+                }
 
-            return {
-                'itemid': result['itemid'],
-                'hostid': result['hostid'],
-                'name': result['name'],
-                'history': result['history'],
-                'trends': result['trends'],
-                'value_type': value_type,
-                'status': result['status'],
-                'units': result['units'],
-                'history_table_name': table_mapping[value_type]['history'],
-                'trends_table_name': table_mapping[value_type]['trends']
-            }
+            if hostname:
+                return map_item(results[0])
+            else:
+                return [map_item(item) for item in results]
+
         except (MySQLError, PostgresError) as e:
             raise RuntimeError(f"Failed to fetch item details: {str(e)}")
 
@@ -374,7 +402,7 @@ class ZabbixDB:
             return "Invalid time range: time_from must be less than or equal to time_to"
 
         monitoring_status = self.get_monitoring_Status(hostname)
-        item_details = self.get_item_detail(hostname, metric_name)
+        item_details = self.get_item_detail(metric_name,hostname)
 
         if item_details is None:
             return f"Item '{metric_name}' not found for host '{hostname}'"
@@ -542,7 +570,54 @@ class ZabbixDB:
             "data": common_issues.to_dict(orient='records')
         }
 
+    def get_host_by_metric(self, metric_name: str, statistical_measure: str = 'last', time_from: int = None, time_to: int = None, limit: int = None):
+        item_details = self.get_item_detail(metric_name)
+        
+        if not item_details:
+            return pd.DataFrame(columns=['hostname', 'unit', 'clock', 'value'])
+        if not isinstance(item_details, list):
+            item_details = [item_details]
 
+        hostnames = list({item['hostname'] for item in item_details})
+
+        rows = []
+        for host in hostnames:
+            metric_data = self.get_metric_data(
+                hostname=host,
+                metric_name=metric_name,
+                time_from=time_from,
+                time_to=time_to,
+                statistical_measure=statistical_measure
+            )
+            if metric_data:
+                data_points = metric_data.get("data")
+                if isinstance(data_points, list) and len(data_points) > 0 and isinstance(data_points[0], dict):
+                    # Expand each dict inside 'data' list into separate rows
+                    for point in data_points:
+                        rows.append({
+                            "hostname": metric_data.get("hostname"),
+                            "unit": metric_data.get("unit"),
+                            "clock": point.get("clock"),
+                            "value": point.get("value")
+                        })
+                else:
+                    # Handle if data is a single value or empty list
+                    rows.append({
+                        "hostname": metric_data.get("hostname"),
+                        "unit": metric_data.get("unit"),
+                        "clock": None,
+                        "value": data_points if data_points else None
+                    })
+
+        if limit is not None:
+            rows = rows[:limit]
+
+        df = pd.DataFrame(rows, columns=['hostname', 'unit', 'clock', 'value'])
+        # Convert clock column to Int64 dtype (nullable integer) so NaNs are preserved
+        df['clock'] = pd.to_numeric(df['clock'], errors='coerce').astype('Int64')
+        df = df.sort_values(by='value', ascending=False, na_position='last')
+
+        return df
 
     def _error_response(self, message, hostname, metric_name, unit, statistical_measure=None):
         return {
@@ -620,21 +695,21 @@ if __name__ == "__main__":
 
     # Sample hostname to query
     hostname = 'Zabbix server'
-    # metric_name = 'Zabbix agent availability'
-    metric_name = 'Host name of Zabbix agent running'
+    metric_name = 'CPU utilization'  # Example metric name
+    # metric_name = 'Host name of Zabbix agent running'
 
     try:
         with ZabbixDB(**db_config) as zbx:
             # result = zbx.get_metric_data(
             #     hostname=hostname,
             #     metric_name=metric_name,
-            #     time_from=1716719399,  # Example start time (Unix timestamp)
-            #     time_to=1748257551,  # Example end time (Unix timestamp)
+            #     time_from=1749032410,  # Example start time (Unix timestamp)
+            #     time_to=1749118810,  # Example end time (Unix timestamp)
             #     statistical_measure='last'  # Example statistical measure
             # )
             # print(result)
-
-            result = zbx.get_alerts()
+            result = zbx.get_host_by_metric(metric_name=metric_name,time_from=1749032410, time_to=1749118810, statistical_measure='max')
+            # result = zbx.get_item_detail(item_name='CPU nice time', hostname=hostname)
             print(result)
 
             # print(zbx.time_difference(1747751299, 1747837706))
