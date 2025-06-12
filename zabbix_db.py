@@ -93,10 +93,9 @@ class ZabbixDB:
             - For others: Single float/int result
         """
         if not data:
-            raise ValueError("Data list is empty.")
-
+            return []
         # operation = operation.lower()
-        values = [item['value'] for item in data]
+        values = [round(item['value'],2) for item in data]
 
         if operation == 'min':
             min_value = min(values)
@@ -107,10 +106,10 @@ class ZabbixDB:
             return [item for item in data if item['value'] == max_value]
 
         elif operation == 'last':
-            return max(data, key=lambda x: x['clock'])
+            return [max(data, key=lambda x: x['clock'])]
 
         elif operation in ('mean', 'avg'):
-            return statistics.mean(values)
+            return statistics.fmean(values)
 
         elif operation == 'median':
             return statistics.median(values)
@@ -320,18 +319,33 @@ class ZabbixDB:
                 return f"Invalid history table name: {trend_table_name}"
             
             # Determine the value column based on the statistical measure
-            if statistical_measure not in ['min','max']:
+            if statistical_measure not in ['min','max','all']:
                 value = 'value_avg'
+                query = f"""
+                SELECT clock, {value} as value
+                FROM {trend_table_name}
+                WHERE itemid = %s
+                AND clock BETWEEN %s AND %s
+                ORDER BY clock DESC
+                """
+            elif statistical_measure == 'all':
+                value = 'num, value_avg, value_min, value_max'
+                query = f"""
+                SELECT clock, {value}
+                FROM {trend_table_name}
+                WHERE itemid = %s
+                AND clock BETWEEN %s AND %s
+                ORDER BY clock DESC
+                """
             else:
                 value = 'value_max' if statistical_measure == 'max' else 'value_min'
-
-            query = f"""
-            SELECT clock, {value} as value
-            FROM {trend_table_name}
-            WHERE itemid = %s
-            AND clock BETWEEN %s AND %s
-            ORDER BY clock DESC
-            """
+                query = f"""
+                SELECT clock, {value} as value
+                FROM {trend_table_name}
+                WHERE itemid = %s
+                AND clock BETWEEN %s AND %s
+                ORDER BY clock DESC
+                """
             
             try:
                 cursor = self.connection.cursor(dictionary=True)
@@ -341,7 +355,14 @@ class ZabbixDB:
 
                 if result is None:
                     return []
-                return result
+                if statistical_measure:
+                    valid_stats = {'min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg'}
+                    if statistical_measure not in valid_stats:
+                        return RuntimeError(f"Invalid statistical measure: {statistical_measure}")
+
+                # Compute the requested statistic
+                    return self.compute_statistic(result, statistical_measure)
+                return result            
         
             except (MySQLError, PostgresError) as e:
                 return RuntimeError(f"Query failed: {str(e)}")
@@ -372,6 +393,13 @@ class ZabbixDB:
 
             if result is None:
                 return []
+            if statistical_measure:
+                valid_stats = {'min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg'}
+                if statistical_measure not in valid_stats:
+                    return RuntimeError(f"Invalid statistical measure: {statistical_measure}")
+
+                # Compute the requested statistic
+                return self.compute_statistic(result, statistical_measure)
             return result
     
         except (MySQLError, PostgresError) as e:
@@ -390,7 +418,7 @@ class ZabbixDB:
         elif time_to <= history_threshold and time_from >= trends_threshold:
             return "get_trends"
         elif time_from < history_threshold and time_to >= history_threshold:
-            return "get_trends_and_history"
+            return "get_trends"
         else:
             return "Invalid range"
 
@@ -399,13 +427,17 @@ class ZabbixDB:
         Fetch historical data for a specific metric (item) of a host within a time range.
         """
         if time_from > time_to:
-            return "Invalid time range: time_from must be less than or equal to time_to"
+            return self._error_response(
+                "Invalid time range: 'time_from' must be less than 'time_to'",
+                hostname, metric_name, "unknown", statistical_measure
+            )
 
         monitoring_status = self.get_monitoring_Status(hostname)
         item_details = self.get_item_detail(metric_name,hostname)
 
         if item_details is None:
-            return f"Item '{metric_name}' not found for host '{hostname}'"
+            message = f"Item '{metric_name}' not found for host '{hostname}'"
+            return self._error_response(message, hostname, metric_name, "unknown", statistical_measure)
 
         if monitoring_status == 1:
             return self._error_response(f"Host '{hostname}' is disabled", hostname, metric_name, "unknown")
@@ -417,7 +449,7 @@ class ZabbixDB:
         trends_table = item_details.get('trends_table_name')
         
         if not history_table:
-            return f"No valid history table for item '{metric_name}' with value_type {item_details['value_type']}"
+            return self._error_response(f"No valid history table for item '{metric_name}' with value_type {item_details['value_type']}", hostname, metric_name, item_details['units'], statistical_measure)
 
         if history_table not in ['history_str', 'history_log', 'history_text']:
             function_name = self.get_function_name(
@@ -455,35 +487,35 @@ class ZabbixDB:
                 data = fetch_trends()
                 return self.compute_statistic(data, statistical_measure) if data else []
 
-            def fetch_both_with_stats():
-                history_data = fetch_history()
-                trend_data = fetch_trends()
-                if not history_data and not trend_data:
-                    return []
-                combined = (history_data or []) + (trend_data or [])
-                return self.compute_statistic(combined, statistical_measure)
+            # def fetch_both_with_stats():
+            #     history_data = fetch_history()
+            #     trend_data = fetch_trends()
+            #     if not history_data and not trend_data:
+            #         return []
+            #     combined = (history_data or []) + (trend_data or [])
+            #     return self.compute_statistic(combined, statistical_measure)
 
-            def fetch_both_raw():
-                history_data = fetch_history()
-                trend_data = fetch_trends()
-                return (history_data or []) + (trend_data or [])
+            # def fetch_both_raw():
+            #     history_data = fetch_history()
+            #     trend_data = fetch_trends()
+            #     return (history_data or []) + (trend_data or [])
 
             fetch_func = {
-                "get_history": fetch_history_with_stats if statistical_measure else lambda: fetch_history() or [],
-                "get_trends": fetch_trends_with_stats if statistical_measure else lambda: fetch_trends() or [],
-                "get_trends_and_history": fetch_both_with_stats if statistical_measure else fetch_both_raw
+                "get_history": fetch_history,
+                "get_trends": fetch_trends,
+                # "get_trends_and_history": fetch_both_with_stats if statistical_measure else fetch_both_raw
             }
 
             data = fetch_func[function_name]()
 
-            return {
-                "status": "success",
-                "hostname": hostname,
-                "metric_name": metric_name,
-                "unit": item_details['units'],
-                "data": data,
-                "statistical_measure": statistical_measure
-            }
+            return self._success_response(
+                data=data,
+                hostname=hostname,
+                metric_name=metric_name,
+                unit=item_details['units'],
+                statistical_measure=statistical_measure
+            )
+        
 
         except (MySQLError, PostgresError) as e:
             return self._error_response(
@@ -547,7 +579,7 @@ class ZabbixDB:
 
         return alerts
 
-    def get_common_issues(self, time_from: int = None, time_to: int = None, hostname: str = None, limit: int = 10, host_group: str = None):
+    def get_common_issues(self, time_from: int = None, time_to: int = None, hostname: str = None, limit: int = None, host_group: str = None):
         alerts=self.get_alerts(time_from, time_to, hostname,host_group)
 
         common_issues = alerts.groupby('event_name').agg(
@@ -564,11 +596,14 @@ class ZabbixDB:
                 "message": "No common issues found",
                 "data": []
             }
-        return {
-            "status": "success",
-            "message": "Common issues retrieved successfully",
-            "data": common_issues.to_dict(orient='records')
-        }
+        return self._success_response(
+            data=common_issues.to_dict(orient='records'),
+            hostname=hostname,
+            time_from=time_from,
+            time_to=time_to,
+            limit=limit,
+            host_group=host_group
+        )
 
     def get_host_by_metric(self, metric_name: str, statistical_measure: str = 'last', time_from: int = None, time_to: int = None, limit: int = None):
         item_details = self.get_item_detail(metric_name)
@@ -579,7 +614,7 @@ class ZabbixDB:
             item_details = [item_details]
 
         hostnames = list({item['hostname'] for item in item_details})
-
+        
         rows = []
         for host in hostnames:
             metric_data = self.get_metric_data(
@@ -589,6 +624,7 @@ class ZabbixDB:
                 time_to=time_to,
                 statistical_measure=statistical_measure
             )
+            
             if metric_data:
                 data_points = metric_data.get("data")
                 if isinstance(data_points, list) and len(data_points) > 0 and isinstance(data_points[0], dict):
@@ -608,7 +644,7 @@ class ZabbixDB:
                         "clock": None,
                         "value": data_points if data_points else None
                     })
-
+    
         if limit is not None:
             rows = rows[:limit]
 
@@ -617,7 +653,10 @@ class ZabbixDB:
         df['clock'] = pd.to_numeric(df['clock'], errors='coerce').astype('Int64')
         df = df.sort_values(by='value', ascending=False, na_position='last')
 
-        return df
+        return self._success_response(
+            data=df.to_dict(orient='records'),
+            metric_name=metric_name
+        )
 
     def _error_response(self, message, hostname, metric_name, unit, statistical_measure=None):
         return {
@@ -629,7 +668,25 @@ class ZabbixDB:
             "data": [],
             "statistical_measure": statistical_measure
         }
+
+    def _success_response(self, data, hostname=None, metric_name=None, unit=None, statistical_measure=None,time_from=None, time_to=None, limit=None, host_group=None):
+        perameter_data  = {
+            "status": "success",
+            "data": data,
+            "hostname": hostname,
+            "metric_name": metric_name,
+            "unit": unit,
+            "statistical_measure": statistical_measure,
+            "time_from": None,
+            "time_to": None,
+            "limit": None,
+            "host_group": None
+        }
         
+        return_data = {k: v for k, v in perameter_data.items() if v is not None}
+        
+        return return_data
+
     def get_host_status(self, hostname: str):
         """
         Fetch the status of a host by its hostname.
@@ -704,11 +761,12 @@ if __name__ == "__main__":
             #     hostname=hostname,
             #     metric_name=metric_name,
             #     time_from=1749032410,  # Example start time (Unix timestamp)
-            #     time_to=1749118810,  # Example end time (Unix timestamp)
+            #     time_to=1749118810,  # Example statistical measure
             #     statistical_measure='last'  # Example statistical measure
             # )
             # print(result)
-            result = zbx.get_host_by_metric(metric_name=metric_name,time_from=1749032410, time_to=1749118810, statistical_measure='max')
+            result = zbx.get_host_by_metric(metric_name=metric_name,time_from=1749032410, time_to=1749118810, statistical_measure='avg')
+            # result = zbx.get_trend_data(itemid=42269,time_from=1746793913,time_to=1749639488,trend_table_name='trends',statistical_measure='all')
             # result = zbx.get_item_detail(item_name='CPU nice time', hostname=hostname)
             print(result)
 
