@@ -8,6 +8,8 @@ import re
 import statistics
 import math
 import pandas as pd
+import os
+import json
 
 class ZabbixDB:
     """A class to handle Zabbix database connections and queries for host status."""
@@ -740,15 +742,12 @@ class ZabbixDB:
 
 
 if __name__ == "__main__":
-    # Sample database configuration for demonstration
-    db_config = {
-        'db_type': 'mysql',  # or 'postgresql'
-        'host': '140.238.230.93',
-        'port': 3306,  # 5432 for PostgreSQL
-        'database': 'zabbix',
-        'user': 'kartik',
-        'password': 'Kartik@24082003'
-    }
+
+    config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+        db_config = config['database_config']
+        db_config.pop('connection_timeout', None)
 
     # Sample hostname to query
     hostname = 'Zabbix server'

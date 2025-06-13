@@ -1,0 +1,11 @@
+{
+    "database_config": {
+        "db_type": "mysql",
+        "host": "xxx.xxx.xxx.xxx",
+        "port": 3306,
+        "database": "zabbix",
+        "user": "<user-name>",
+        "password": "<password>",
+        "connection_timeout": 10
+    }
+}
