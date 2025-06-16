@@ -101,6 +101,26 @@ class QueryBuilder:
         elif tag_value:
             return base_query + f" AND ht.value = '{tag_value}'"
         return base_query
+    
+    @staticmethod
+    def build_item_by_tag_query(item_name: str, hostname: str = None, tag_name: str = None, tag_value: str = None) -> str:
+        values = "it.tag, it.value, i.name" if not hostname else "it.tag, it.value, i.name, h.host"
+        base_query = f"""
+        SELECT DISTINCT {values}
+        from item_tag it
+        JOIN items i ON i.itemid = it.itemid
+        JOIN hosts h ON i.hostid = h.hostid
+        WHERE i.name = '{item_name}'
+        """
+        if hostname:
+            base_query += f" AND h.host = '{hostname}'"
+        if tag_name and tag_value:
+            return base_query + f" AND it.tag = '{tag_name}' AND it.value = '{tag_value}'"
+        elif tag_name:
+            return base_query + f" AND it.tag = '{tag_name}'"
+        elif tag_value:
+            return base_query + f" AND it.value = '{tag_value}'"
+        return base_query
 
     
 class ZabbixDB:
@@ -706,6 +726,29 @@ class ZabbixDB:
         except (MySQLError, PostgresError) as e:
             logger.error(f"Query failed in get_tag_for_host: {str(e)}")
             return {"status": "error", "message": f"Query failed: {str(e)}", "hostname": hostname}
+
+    def get_tag_for_item(self, item_name: str, hostname: str = None, tag_name: str = None, tag_value: str = None) -> List[Dict[str, str]]:
+        """Get tags for a specific item."""
+        self._ensure_connection()
+        try:
+            with self.connection.cursor(dictionary=True) as cursor:
+                query = QueryBuilder.build_item_by_tag_query(item_name, hostname, tag_name, tag_value)
+                
+                cursor.execute(query)
+                results = cursor.fetchall()
+                
+                if not results:
+                    return {"status": "error", "message": f"No tags found for item '{item_name}'"}
+                    
+                return {
+                    "status": "success",
+                    "data": results,
+                    "item_name": item_name,
+                    "hostname": hostname
+                }
+        except (MySQLError, PostgresError) as e:
+            logger.error(f"Query failed in get_tag_for_item: {str(e)}")
+            return {"status": "error", "message": f"Query failed: {str(e)}", "item_name": item_name, "hostname": hostname}
         
     def _error_response(self, message: str, hostname: str = None, metric_name: str = None, unit: str = None, statistical_measure: str = None, **kwargs):
         """Create error response dictionary."""
