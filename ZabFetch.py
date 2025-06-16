@@ -85,11 +85,29 @@ class QueryBuilder:
         AND clock BETWEEN %s AND %s
         ORDER BY clock DESC
         """
+    @staticmethod
+    def build_host_by_tag_query(hostname: str, tag_name: str = None,tag_value: str = None) -> str:
+        base_query = f"""
+        SELECT ht.tag, ht.value,h.host
+        FROM hosts h
+        JOIN hosts_templates hst ON h.hostid = hst.hostid
+        JOIN host_tag ht ON ht.hostid IN (h.hostid, hst.templateid)
+        WHERE h.host = '{hostname}'
+        """
+        if tag_name and tag_value:
+            return base_query + f" AND ht.tag = '{tag_name}' AND ht.value = '{tag_value}'"
+        elif tag_name:
+            return base_query + f" AND ht.tag = '{tag_name}'"
+        elif tag_value:
+            return base_query + f" AND ht.value = '{tag_value}'"
+        return base_query
 
+    
 class ZabbixDB:
     """A class to handle Zabbix database connections and queries for host status."""
     
     VALID_STATISTICS = {'min', 'max', 'mean', 'median', 'stdev', 'sum', 'count', 'range', 'mad', 'last', 'avg'}
+    
     TABLE_MAPPING = {
         0: {'history': 'history', 'trends': 'trends'},
         1: {'history': 'history_str', 'trends': None},
@@ -667,6 +685,28 @@ class ZabbixDB:
                 statistical_measure=statistical_measure
             )
 
+    def get_tag_for_host(self, hostname: str,tag_name: str = None,tag_value: str = None) -> List[Dict[str, str]]:
+        """Get tags for a specific host."""
+        self._ensure_connection()
+        try:
+            with self.connection.cursor(dictionary=True) as cursor:
+                query = QueryBuilder.build_host_by_tag_query(hostname, tag_name, tag_value)
+                
+                cursor.execute(query)
+                results = cursor.fetchall()
+                
+                if not results:
+                    return {"status": "error", "message": f"No tags found for host '{hostname}'"}
+                    
+                return {
+                    "status": "success",
+                    "data": results,
+                    "hostname": hostname
+                }
+        except (MySQLError, PostgresError) as e:
+            logger.error(f"Query failed in get_tag_for_host: {str(e)}")
+            return {"status": "error", "message": f"Query failed: {str(e)}", "hostname": hostname}
+        
     def _error_response(self, message: str, hostname: str = None, metric_name: str = None, unit: str = None, statistical_measure: str = None, **kwargs):
         """Create error response dictionary."""
         response = {
