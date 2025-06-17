@@ -524,6 +524,14 @@ class ZabbixDB:
             h.name AS host,
             t.description AS trigger_name,
             e.name AS event_name,
+            CASE e.severity
+                WHEN 0 THEN 'Not classified'
+                WHEN 1 THEN 'Information'
+                WHEN 2 THEN 'Warning'
+                WHEN 3 THEN 'Average'
+                WHEN 4 THEN 'High'
+                WHEN 5 THEN 'Disaster'
+            END AS severity,
             e.eventid,
             e.acknowledged,
             e.clock AS start_time,
@@ -749,7 +757,67 @@ class ZabbixDB:
         except (MySQLError, PostgresError) as e:
             logger.error(f"Query failed in get_tag_for_item: {str(e)}")
             return {"status": "error", "message": f"Query failed: {str(e)}", "item_name": item_name, "hostname": hostname}
+
+    def get_tag_for_problem(self,eventid: int, tag_name: str = None, tag_value: str = None) -> List[Dict[str, str]]:
+        query = """
+        SELECT pt.tag,pt.value,pt.eventid from problem_tag pt where eventid = %s
+        """
+        self._ensure_connection()
+        try:
+            with self.connection.cursor(dictionary=True) as cursor:
+                cursor.execute(query, (eventid,))
+                results = cursor.fetchall()
+                
+                if not results:
+                    return {"status": "error", "message": f"No tags found for event '{eventid}'"}
+                    
+                if tag_name and tag_value:
+                    results = [r for r in results if r['tag'] == tag_name and r['value'] == tag_value]
+                elif tag_name:
+                    results = [r for r in results if r['tag'] == tag_name]
+                elif tag_value:
+                    results = [r for r in results if r['value'] == tag_value]
+
+                return {
+                    "status": "success",
+                    "data": results,
+                    "eventid": eventid
+                }
         
+        except (MySQLError, PostgresError) as e:
+            logger.error(f"Query failed in get_tag_for_problem: {str(e)}")
+            return {"status": "error", "message": f"Query failed: {str(e)}", "eventid": eventid}
+
+    def get_acknowledgement(self, eventid: list[int]) -> Dict[str, Any]:
+        """Get acknowledgement details for a specific event."""
+        self._ensure_connection()
+        
+        placeholders = ','.join(['%s'] * len(eventid))
+
+        query = f"""
+        SELECT ack.eventid, ack.clock, ack.message, u.name
+        FROM acknowledges ack
+        JOIN users u ON u.userid = ack.userid
+        WHERE ack.eventid IN ({placeholders})
+        """
+        
+        try:
+            with self.connection.cursor(dictionary=True) as cursor:
+                cursor.execute(query,eventid)
+                result = cursor.fetchall()
+                
+                if not result:
+                    return {"status": "No Data","data": result,"eventid": eventid}
+                    
+                return {
+                    "status": "success",
+                    "data": result,
+                    "eventid": eventid
+                }
+        except (MySQLError, PostgresError) as e:
+            logger.error(f"Query failed in get_acknowledgement: {str(e)}")
+            return {"status": "error", "message": f"Query failed: {str(e)}", "eventid": eventid}
+
     def _error_response(self, message: str, hostname: str = None, metric_name: str = None, unit: str = None, statistical_measure: str = None, **kwargs):
         """Create error response dictionary."""
         response = {
