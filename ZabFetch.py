@@ -139,21 +139,21 @@ class QueryBuilder:
     @staticmethod
     def build_tag_for_problem_query(eventid: int = None,event_name: str = None, tag_name: str = None, tag_value: str = None) -> str:
         base_query = """
-        SELECT pt.tag, pt.value, pt.eventid,e.name
-        FROM problem_tag pt
-        JOIN events e ON pt.eventid = e.eventid
+        SELECT et.tag, et.value, et.eventid,e.name
+        FROM event_tag et
+        JOIN events e ON et.eventid = e.eventid
         """
         conditions = []
         if eventid:
-            conditions.append(f"pt.eventid = '{eventid}'")
+            conditions.append(f"et.eventid = '{eventid}'")
         if event_name:
             conditions.append(f"e.name = '{event_name}'")
 
         if tag_name:
-            conditions.append(f"pt.tag = '{tag_name}'")
+            conditions.append(f"et.tag = '{tag_name}'")
 
         if tag_value:
-            conditions.append(f"pt.value = '{tag_value}'")
+            conditions.append(f"et.value = '{tag_value}'")
 
         if conditions:
             return base_query + " WHERE " + " AND ".join(conditions)
@@ -361,6 +361,7 @@ class ZabbixDB:
         FROM hstgrp g
         JOIN hosts_groups hg ON g.groupid = hg.groupid
         JOIN hosts h ON hg.hostid = h.hostid
+        WHERE h.status = 0 AND h.flags IN (0, 4)
         """
         
         try:
@@ -803,7 +804,6 @@ class ZabbixDB:
         try:
             with self.connection.cursor(dictionary=True) as cursor:
                 query = QueryBuilder.build_tag_for_problem_query(eventid, event_name, tag_name, tag_value)
-                
                 cursor.execute(query)
                 results = cursor.fetchall()
                 
