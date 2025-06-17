@@ -85,41 +85,79 @@ class QueryBuilder:
         AND clock BETWEEN %s AND %s
         ORDER BY clock DESC
         """
+    
     @staticmethod
-    def build_host_by_tag_query(hostname: str, tag_name: str = None,tag_value: str = None) -> str:
+    def build_host_by_tag_query(hostname: str=None, tag_name: str = None,tag_value: str = None) -> str:
         base_query = f"""
         SELECT ht.tag, ht.value,h.host
         FROM hosts h
         JOIN hosts_templates hst ON h.hostid = hst.hostid
         JOIN host_tag ht ON ht.hostid IN (h.hostid, hst.templateid)
-        WHERE h.host = '{hostname}'
         """
-        if tag_name and tag_value:
-            return base_query + f" AND ht.tag = '{tag_name}' AND ht.value = '{tag_value}'"
-        elif tag_name:
-            return base_query + f" AND ht.tag = '{tag_name}'"
-        elif tag_value:
-            return base_query + f" AND ht.value = '{tag_value}'"
+        conditions = []
+
+        if hostname:
+            conditions.append(f"h.host = '{hostname}'")
+
+        if tag_name:
+            conditions.append(f"ht.tag = '{tag_name}'")
+
+        if tag_value:
+            conditions.append(f"ht.value = '{tag_value}'")
+
+        if conditions:
+            return base_query + " WHERE " + " AND ".join(conditions)
+
         return base_query
     
     @staticmethod
-    def build_item_by_tag_query(item_name: str, hostname: str = None, tag_name: str = None, tag_value: str = None) -> str:
+    def build_item_by_tag_query(item_name: str = None, hostname: str = None, tag_name: str = None, tag_value: str = None) -> str:
         values = "it.tag, it.value, i.name" if not hostname else "it.tag, it.value, i.name, h.host"
         base_query = f"""
         SELECT DISTINCT {values}
         from item_tag it
         JOIN items i ON i.itemid = it.itemid
         JOIN hosts h ON i.hostid = h.hostid
-        WHERE i.name = '{item_name}'
         """
+        conditions = []
+        if item_name:
+            conditions.append(f"i.name = '{item_name}'")
         if hostname:
-            base_query += f" AND h.host = '{hostname}'"
-        if tag_name and tag_value:
-            return base_query + f" AND it.tag = '{tag_name}' AND it.value = '{tag_value}'"
-        elif tag_name:
-            return base_query + f" AND it.tag = '{tag_name}'"
-        elif tag_value:
-            return base_query + f" AND it.value = '{tag_value}'"
+            conditions.append(f"h.host = '{hostname}'")
+
+        if tag_name:
+            conditions.append(f"it.tag = '{tag_name}'")
+
+        if tag_value:
+            conditions.append(f"it.value = '{tag_value}'")
+
+        if conditions:
+            return base_query + " WHERE " + " AND ".join(conditions)
+
+        return base_query
+    
+    @staticmethod
+    def build_tag_for_problem_query(eventid: int = None,event_name: str = None, tag_name: str = None, tag_value: str = None) -> str:
+        base_query = """
+        SELECT pt.tag, pt.value, pt.eventid,e.name
+        FROM problem_tag pt
+        JOIN events e ON pt.eventid = e.eventid
+        """
+        conditions = []
+        if eventid:
+            conditions.append(f"pt.eventid = '{eventid}'")
+        if event_name:
+            conditions.append(f"e.name = '{event_name}'")
+
+        if tag_name:
+            conditions.append(f"pt.tag = '{tag_name}'")
+
+        if tag_value:
+            conditions.append(f"pt.value = '{tag_value}'")
+
+        if conditions:
+            return base_query + " WHERE " + " AND ".join(conditions)
+
         return base_query
 
     
@@ -311,6 +349,7 @@ class ZabbixDB:
         """Get hosts by group name."""
         self._ensure_connection()
         
+
         query = """
         SELECT g.name AS group_name, h.host AS host_name
         FROM hstgrp g
@@ -318,9 +357,10 @@ class ZabbixDB:
         JOIN hosts h ON hg.hostid = h.hostid
         WHERE g.name = %s
         """ if host_group.lower() != 'all' else """
-        SELECT h.host AS host_name
-        FROM hosts h
-        WHERE h.status = 0 AND h.flags IN (0, 4)
+        SELECT g.name AS group_name, h.host AS host_name
+        FROM hstgrp g
+        JOIN hosts_groups hg ON g.groupid = hg.groupid
+        JOIN hosts h ON hg.hostid = h.hostid
         """
         
         try:
@@ -713,7 +753,7 @@ class ZabbixDB:
                 statistical_measure=statistical_measure
             )
 
-    def get_tag_for_host(self, hostname: str,tag_name: str = None,tag_value: str = None) -> List[Dict[str, str]]:
+    def get_tag_for_host(self, hostname: str= None,tag_name: str = None,tag_value: str = None) -> List[Dict[str, str]]:
         """Get tags for a specific host."""
         self._ensure_connection()
         try:
@@ -735,7 +775,7 @@ class ZabbixDB:
             logger.error(f"Query failed in get_tag_for_host: {str(e)}")
             return {"status": "error", "message": f"Query failed: {str(e)}", "hostname": hostname}
 
-    def get_tag_for_item(self, item_name: str, hostname: str = None, tag_name: str = None, tag_value: str = None) -> List[Dict[str, str]]:
+    def get_tag_for_item(self, item_name: str = None, hostname: str = None, tag_name: str = None, tag_value: str = None) -> List[Dict[str, str]]:
         """Get tags for a specific item."""
         self._ensure_connection()
         try:
@@ -758,35 +798,27 @@ class ZabbixDB:
             logger.error(f"Query failed in get_tag_for_item: {str(e)}")
             return {"status": "error", "message": f"Query failed: {str(e)}", "item_name": item_name, "hostname": hostname}
 
-    def get_tag_for_problem(self,eventid: int, tag_name: str = None, tag_value: str = None) -> List[Dict[str, str]]:
-        query = """
-        SELECT pt.tag,pt.value,pt.eventid from problem_tag pt where eventid = %s
-        """
+    def get_tag_for_problem(self,eventid: int = None,event_name: str = None, tag_name: str = None, tag_value: str = None) -> List[Dict[str, str]]:
         self._ensure_connection()
         try:
             with self.connection.cursor(dictionary=True) as cursor:
-                cursor.execute(query, (eventid,))
+                query = QueryBuilder.build_tag_for_problem_query(eventid, event_name, tag_name, tag_value)
+                
+                cursor.execute(query)
                 results = cursor.fetchall()
                 
                 if not results:
-                    return {"status": "error", "message": f"No tags found for event '{eventid}'"}
+                    return {"status": "error", "message": f"No tags found for item '{event_name}'"}
                     
-                if tag_name and tag_value:
-                    results = [r for r in results if r['tag'] == tag_name and r['value'] == tag_value]
-                elif tag_name:
-                    results = [r for r in results if r['tag'] == tag_name]
-                elif tag_value:
-                    results = [r for r in results if r['value'] == tag_value]
-
                 return {
                     "status": "success",
                     "data": results,
+                    "event_name": event_name,
                     "eventid": eventid
                 }
-        
         except (MySQLError, PostgresError) as e:
-            logger.error(f"Query failed in get_tag_for_problem: {str(e)}")
-            return {"status": "error", "message": f"Query failed: {str(e)}", "eventid": eventid}
+            logger.error(f"Query failed in get_tag_for_item: {str(e)}")
+            return {"status": "error", "message": f"Query failed: {str(e)}", "event_name": event_name, "eventid": eventid}
 
     def get_acknowledgement(self, eventid: list[int]) -> Dict[str, Any]:
         """Get acknowledgement details for a specific event."""
